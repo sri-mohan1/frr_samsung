@@ -3120,8 +3120,61 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	if (p->family == AF_INET6 || peer_cap_enhe(peer, afi, safi)) {
 		if (IN6_IS_ADDR_LINKLOCAL(&attr->mp_nexthop_global)) {
 			subgroup_announce_reset_nhop(AF_INET6, attr);
-				nh_reset = true;
-			}
+			nh_reset = true;
+		}
+	}
+
+	/*
+	 * RFC 4271 Section 5.1.3:
+	 * "A route originated by a BGP speaker SHALL NOT be
+	 * advertised to a peer using an address of that peer
+	 * as NEXT_HOP."
+	 *
+	 * After route-map processing, the NEXT_HOP may have been
+	 * set (e.g., via "set ip next-hop") to the receiving
+	 * peer's own address. Reset it to self to comply with
+	 * the RFC and avoid a blackhole. This must happen before
+	 * the WECMP/link-bandwidth and AIGP adjustments below,
+	 * which are conditioned on nh_reset being true.
+	 */
+	if (from == bgp->peer_self && peer->connection && peer->connection->su_remote) {
+		if (afi == AFI_IP && safi == SAFI_UNICAST &&
+		    sockunion_family(peer->connection->su_remote) == AF_INET &&
+		    IPV4_ADDR_SAME(&attr->nexthop, &peer->connection->su_remote->sin.sin_addr)) {
+			flog_warn(EC_BGP_NEXTHOP_SELF_PEER,
+				  "%s: %pBP [Update:SEND] %pFX NEXT_HOP %pI4 equals peer address, resetting to self (RFC 4271 5.1.3)",
+				  __func__, peer, p, &attr->nexthop);
+			subgroup_announce_reset_nhop(AF_INET, attr);
+			/*
+			 * Clear the route-map nexthop change flags so the
+			 * update formation code (bpacket_reformat_for_peer)
+			 * fills in our local address instead of leaving the
+			 * nexthop as 0.0.0.0.
+			 */
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_IPV4_NHOP_CHANGED);
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_VPNV4_NHOP_CHANGED);
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_NEXTHOP_PEER_ADDRESS);
+			nh_reset = true;
+		} else if (NEXTHOP_IS_V6 &&
+			   sockunion_family(peer->connection->su_remote) == AF_INET6 &&
+			   IPV6_ADDR_SAME(&attr->mp_nexthop_global,
+					  &peer->connection->su_remote->sin6.sin6_addr)) {
+			flog_warn(EC_BGP_NEXTHOP_SELF_PEER,
+				  "%s: %pBP [Update:SEND] %pFX NEXT_HOP %pI6 equals peer address, resetting to self (RFC 4271 5.1.3)",
+				  __func__, peer, p, &attr->mp_nexthop_global);
+			subgroup_announce_reset_nhop(AF_INET6, attr);
+			/*
+			 * Clear the route-map nexthop change flags so the
+			 * update formation code (bpacket_reformat_for_peer)
+			 * fills in our local address instead of leaving the
+			 * nexthop as ::.
+			 */
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_IPV6_GLOBAL_NHOP_CHANGED);
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_VPNV6_GLOBAL_NHOP_CHANGED);
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_IPV6_LL_NHOP_CHANGED);
+			UNSET_FLAG(attr->rmap_change_flags, BATTR_RMAP_NEXTHOP_PEER_ADDRESS);
+			nh_reset = true;
+		}
 	}
 
 	/* If this is an iBGP, send Origin Validation State (OVS)
